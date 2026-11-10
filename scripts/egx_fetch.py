@@ -106,6 +106,7 @@ def analyse_frame(df, source_name):
 def normalise(df):
     """Best-effort normalisation of a library DataFrame to Date/Open/.../Close."""
     import pandas as pd
+    import pandas.api
     if df is None:
         return None
     if isinstance(df, dict):  # some APIs return {ticker: DataFrame}
@@ -135,6 +136,10 @@ def normalise(df):
         elif lc in ("volume", "vol", "v"):
             colmap[c] = "Volume"
     df = df.rename(columns=colmap)
+    if "Close" not in df.columns:
+        numeric = [c for c in df.columns if c != "Date" and pd.api.types.is_numeric_dtype(df[c])]
+        if len(numeric) == 1:
+            df = df.rename(columns={numeric[0]: "Close"})
     if "Date" not in df.columns or "Close" not in df.columns:
         return None
     keep = [c for c in ("Date", "Open", "High", "Low", "Close", "Volume") if c in df.columns]
@@ -142,67 +147,100 @@ def normalise(df):
 
 
 def try_egxpy():
-    src = {"install_attempts": [], "fetch_attempts": []}
-    mod = None
+    import importlib
+    from datetime import date as _date
+    src = {"install_attempts": [], "fetch_attempts": [], "import_error": None}
+    # --- install egxpy itself ---
     try:
         import egxpy  # noqa
-        mod = egxpy
-        src["install_attempts"].append({"spec": "(preinstalled by requirements-egx)", "ok": True})
+        src["install_attempts"].append({"spec": "(preinstalled)", "ok": True})
     except ImportError:
+        installed = False
         for spec in ("egxpy", "git+https://github.com/mmabas77/egxpy"):
             ok, tail = pip_install(spec)
             src["install_attempts"].append({"spec": spec, "ok": ok, "output_tail": tail})
             if ok:
-                try:
-                    import importlib
-                    mod = importlib.import_module("egxpy")
-                    break
-                except ImportError as e:
-                    src["install_attempts"].append({"spec": spec, "ok": False,
-                                                    "output_tail": f"installed but import failed: {e}"})
-    if mod is None:
+                installed = True
+                break
+        if not installed:
+            src["status"] = "failed"
+            src["failure"] = "egxpy could not be installed from PyPI or GitHub (mmabas77 fork; egxlytics repo is gone)"
+            return src
+    # --- import egxpy.download, installing missing deps as they surface ---
+    dl = None
+    dep_specs = {"streamlit": "streamlit",
+                 "tvDatafeed": "git+https://github.com/rongardF/tvdatafeed@main",
+                 "holidays": "holidays", "retry": "retry", "scipy": "scipy",
+                 "plotly": "plotly", "xlsxwriter": "XlsxWriter"}
+    for round_ in range(4):
+        try:
+            importlib.invalidate_caches()
+            dl = importlib.import_module("egxpy.download")
+            src["import_error"] = None
+            break
+        except Exception as e:
+            err = f"{type(e).__name__}: {str(e)[:300]}"
+            src["import_error"] = err
+            missing = None
+            if "No module named" in str(e):
+                missing = str(e).split("No module named")[-1].strip().strip("'\"").split(".")[0]
+            spec = dep_specs.get(missing or "", missing)
+            if not spec:
+                break
+            ok, tail = pip_install(spec, timeout=900)
+            src["install_attempts"].append({"spec": f"dep:{spec}", "ok": ok, "output_tail": tail})
+            if not ok:
+                break
+    if dl is None:
         src["status"] = "failed"
-        src["failure"] = "egxpy could not be installed/imported from PyPI or its GitHub repo"
+        src["failure"] = f"egxpy installed but egxpy.download would not import: {src['import_error']}"
         return src
-    try:
-        from egxpy import download as dl
-    except Exception:
-        dl = mod
-    fns = [n for n in ("get_OHLCV_data", "get_EGXdata", "get_EGX_intraday_data") if hasattr(dl, n)]
+    fns = [n for n in ("get_OHLCV_data", "get_EGXdata") if hasattr(dl, n)]
     src["available_functions"] = fns
     if not fns:
         src["status"] = "failed"
-        src["failure"] = f"egxpy imported but exposes none of the expected download functions (dir: {[a for a in dir(dl) if not a.startswith('_')][:40]})"
+        src["failure"] = "egxpy.download imported but has neither get_OHLCV_data nor get_EGXdata"
         return src
-
     import pandas as pd
-    windows = [("2018-01-01", "2026-11-10"),
-               ("2019-06-01", "2019-08-15"), ("2021-04-01", "2021-06-15"),
-               ("2024-09-01", "2024-11-15"), ("2026-03-01", "2026-05-15"),
-               ("2026-08-01", "2026-11-10")]
     frames = []
-    for fname in fns:
-        fn = getattr(dl, fname)
-        for (s, e) in windows:
-            for symarg in (["POUL"], "POUL"):
-                label = f"{fname}({symarg!r}, {s}, {e})"
-                try:
-                    out = run_with_timeout(lambda: fn(symarg, s, e), 420)
-                    ndf = normalise(out)
-                    src["fetch_attempts"].append({"call": label, "ok": ndf is not None,
-                                                  "rows": (int(len(ndf)) if ndf is not None else 0)})
-                    if ndf is not None:
-                        frames.append(ndf)
-                except Exception as ex:
-                    src["fetch_attempts"].append({"call": label, "ok": False,
-                                                  "error": f"{type(ex).__name__}: {str(ex)[:300]}"})
-            if frames and fname == fns[0]:
-                break  # first function + widest window worked; enough
-        if frames:
-            break
+    # --- primary: full OHLCV via TradingView, one symbol, big bar counts ---
+    if "get_OHLCV_data" in fns:
+        fn = getattr(dl, "get_OHLCV_data")
+        for n_bars in (3000, 1500, 600):
+            try:
+                out = run_with_timeout(lambda: fn(symbol="POUL", exchange="EGX",
+                                                  interval="Daily", n_bars=n_bars), 420)
+                ndf = normalise(out)
+                src["fetch_attempts"].append({"call": f"get_OHLCV_data(POUL, EGX, Daily, {n_bars})",
+                                              "ok": ndf is not None,
+                                              "rows": (int(len(ndf)) if ndf is not None else 0)})
+                if ndf is not None:
+                    frames.append(ndf)
+                    break
+            except Exception as ex:
+                src["fetch_attempts"].append({"call": f"get_OHLCV_data(POUL, EGX, Daily, {n_bars})",
+                                              "ok": False, "error": f"{type(ex).__name__}: {str(ex)[:300]}"})
+    # --- fallback: close prices over explicit windows (no opens) ---
+    if not frames and "get_EGXdata" in fns:
+        fn = getattr(dl, "get_EGXdata")
+        for (s, e) in (("2018-01-01", "2026-11-10"), ("2024-01-01", "2026-11-10")):
+            try:
+                out = run_with_timeout(lambda: fn(stock_list=["POUL"], interval="Daily",
+                                                  start=_date.fromisoformat(s),
+                                                  end=_date.fromisoformat(e)), 420)
+                ndf = normalise(out)
+                src["fetch_attempts"].append({"call": f"get_EGXdata([POUL], Daily, {s}, {e})",
+                                              "ok": ndf is not None,
+                                              "rows": (int(len(ndf)) if ndf is not None else 0)})
+                if ndf is not None:
+                    frames.append(ndf)
+                    break
+            except Exception as ex:
+                src["fetch_attempts"].append({"call": f"get_EGXdata([POUL], Daily, {s}, {e})",
+                                              "ok": False, "error": f"{type(ex).__name__}: {str(ex)[:300]}"})
     if not frames:
         src["status"] = "failed"
-        src["failure"] = "egxpy installed and imported, but every fetch call failed or returned no usable OHLC frame (see fetch_attempts)"
+        src["failure"] = "egxpy installed and imported, but TradingView fetches returned no usable data (see fetch_attempts)"
         return src
     merged = pd.concat(frames, ignore_index=True)
     info = analyse_frame(merged, "egxpy")
