@@ -149,7 +149,7 @@ def try_egxpy():
         mod = egxpy
         src["install_attempts"].append({"spec": "(preinstalled by requirements-egx)", "ok": True})
     except ImportError:
-        for spec in ("egxpy", "git+https://github.com/egxlytics/egxpy"):
+        for spec in ("egxpy", "git+https://github.com/mmabas77/egxpy"):
             ok, tail = pip_install(spec)
             src["install_attempts"].append({"spec": spec, "ok": ok, "output_tail": tail})
             if ok:
